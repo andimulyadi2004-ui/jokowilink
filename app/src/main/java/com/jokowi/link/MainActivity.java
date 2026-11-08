@@ -2,6 +2,9 @@ package com.jokowi.link;
 
 import android.app.Activity;
 import android.app.UiModeManager;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.graphics.Color;
@@ -14,43 +17,48 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
-import android.view.Gravity;
+import android.util.TypedValue;
 import android.view.View;
+import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.jcraft.jsch.ChannelExec;
+import com.jcraft.jsch.ChannelShell;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.Session;
 
-import java.io.ByteArrayInputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
     static final int BG = 0xFF15131C;
 
-    boolean tv;
-    float f = 1f;
-    float dens;
+    boolean tv, diTerminal, memulai;
+    float f = 1f, dens, fontSp = 12f;
     volatile Session sesi;
-    volatile ChannelExec kanal;
-    int mode = 1;
-    final String[] namaMode = {"Shell", "Python", "Node.js"};
-    final String[] perintah = {"bash -s", "python -u -", "node -"};
-
-    EditText etHost, etPort, etUser, etPass, etKode;
-    TextView status, out;
-    ScrollView outScroll;
-    Button btnMode, btnConnect;
+    volatile ChannelShell shell;
+    volatile OutputStream shOut;
+    volatile int lastC = 80, lastR = 24;
+    final ExecutorService tulisan = Executors.newSingleThreadExecutor();
     final Handler ui = new Handler(Looper.getMainLooper());
-    final StringBuilder buf = new StringBuilder();
+
+    EditText etHost, etPort, etUser, etPass;
+    TextView status;
+    Button btnConnect, btnCtrl;
+    TermView tvw;
 
     int dp(float v) { return (int) (v * f * dens); }
+
+    float px() {
+        return TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, fontSp * f, getResources().getDisplayMetrics());
+    }
 
     StateListDrawable kotak(int warna, int r) {
         GradientDrawable normal = new GradientDrawable();
@@ -103,98 +111,6 @@ public class MainActivity extends Activity {
         status.setTextColor(warna);
     }
 
-    void tulis(String s) {
-        final String t = s.replaceAll("\u001B\\[[;?0-9]*[A-Za-z]", "").replace("\r", "");
-        ui.post(() -> {
-            buf.append(t);
-            if (buf.length() > 40000) buf.delete(0, buf.length() - 30000);
-            out.setText(buf.toString());
-            outScroll.post(() -> outScroll.fullScroll(View.FOCUS_DOWN));
-        });
-    }
-
-    void sambung(Runnable setelah) {
-        final String host = etHost.getText().toString().trim();
-        final String user = etUser.getText().toString().trim();
-        final String pass = etPass.getText().toString();
-        int pt = 8022;
-        try { pt = Integer.parseInt(etPort.getText().toString().trim()); } catch (Exception ignored) {}
-        final int port = pt;
-        if (host.isEmpty() || user.isEmpty()) {
-            Toast.makeText(this, "Isi IP dan username dulu", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        getSharedPreferences("p", 0).edit()
-                .putString("h", host).putString("p", String.valueOf(port)).putString("u", user).apply();
-        setStatus("Menyambung ke " + host + "...", 0xFFFFC857);
-        new Thread(() -> {
-            try {
-                if (sesi != null && sesi.isConnected()) {
-                    if (setelah != null) ui.post(setelah);
-                    return;
-                }
-                JSch j = new JSch();
-                Session s = j.getSession(user, host, port);
-                s.setPassword(pass);
-                s.setConfig("StrictHostKeyChecking", "no");
-                s.setServerAliveInterval(15000);
-                s.connect(8000);
-                sesi = s;
-                ui.post(() -> {
-                    setStatus("Tersambung: " + user + "@" + host, 0xFF3DDC97);
-                    btnConnect.setText("Putuskan");
-                    if (setelah != null) setelah.run();
-                });
-            } catch (Exception e) {
-                ui.post(() -> setStatus("Gagal: " + e.getMessage(), 0xFFFF6B8A));
-            }
-        }).start();
-    }
-
-    void putus() {
-        final Session s = sesi;
-        sesi = null;
-        new Thread(() -> { try { if (s != null) s.disconnect(); } catch (Exception ignored) {} }).start();
-        btnConnect.setText("Sambungkan");
-        setStatus("Belum tersambung", 0xFF9A93AA);
-    }
-
-    void jalankan() {
-        final String kode = etKode.getText().toString();
-        if (kode.trim().isEmpty()) {
-            Toast.makeText(this, "Tulis kodenya dulu", Toast.LENGTH_SHORT).show();
-            return;
-        }
-        if (sesi == null || !sesi.isConnected()) {
-            sambung(this::jalankan);
-            return;
-        }
-        final int m = mode;
-        tulis("\n>>> " + namaMode[m] + "\n");
-        new Thread(() -> {
-            try {
-                ChannelExec c = (ChannelExec) sesi.openChannel("exec");
-                kanal = c;
-                c.setCommand(perintah[m]);
-                c.setInputStream(new ByteArrayInputStream(kode.getBytes(StandardCharsets.UTF_8)));
-                OutputStream o = new OutputStream() {
-                    @Override public void write(int b) { write(new byte[]{(byte) b}, 0, 1); }
-                    @Override public void write(byte[] b, int off, int len) {
-                        tulis(new String(b, off, len, StandardCharsets.UTF_8));
-                    }
-                };
-                c.setOutputStream(o);
-                c.setErrStream(o);
-                c.connect(5000);
-                while (!c.isClosed()) Thread.sleep(80);
-                tulis("\n[selesai, kode " + c.getExitStatus() + "]\n");
-                c.disconnect();
-            } catch (Exception e) {
-                tulis("\n[error: " + e.getMessage() + "]\n");
-            }
-        }).start();
-    }
-
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         dens = getResources().getDisplayMetrics().density;
@@ -203,8 +119,13 @@ public class MainActivity extends Activity {
         f = tv ? 1.35f : 1f;
         getWindow().setStatusBarColor(BG);
         getWindow().setNavigationBarColor(BG);
-        SharedPreferences sp = getSharedPreferences("p", 0);
+        tampilLogin();
+    }
 
+    // ---------- layar login ----------
+    void tampilLogin() {
+        diTerminal = false;
+        SharedPreferences sp = getSharedPreferences("p", 0);
         LinearLayout kiri = new LinearLayout(this);
         kiri.setOrientation(LinearLayout.VERTICAL);
         kiri.setPadding(dp(20), dp(tv ? 24 : 44), dp(20), dp(16));
@@ -219,7 +140,7 @@ public class MainActivity extends Activity {
         kiri.addView(judul);
 
         TextView sub = new TextView(this);
-        sub.setText("Ngoding lewat sini, jalannya di Termux pemilik.");
+        sub.setText("Terminal ke Termux pemilik. cd, nano, python, semuanya jalan di sana.");
         sub.setTextColor(0xFF9A93AA);
         sub.setTextSize(14 * f);
         sub.setPadding(0, dp(4), 0, dp(12));
@@ -237,110 +158,213 @@ public class MainActivity extends Activity {
         status = new TextView(this);
         status.setTextSize(14 * f);
         status.setPadding(0, dp(10), 0, 0);
-        setStatus("Belum tersambung", 0xFF9A93AA);
         kiri.addView(status);
+        setStatus("Belum tersambung", 0xFF9A93AA);
 
-        btnConnect = tombol("Sambungkan", 0xFF4CC9F0, v -> {
-            if (sesi != null && sesi.isConnected()) putus(); else sambung(null);
-        });
+        btnConnect = tombol("Sambungkan", 0xFF4CC9F0, v -> sambung());
         kiri.addView(btnConnect);
 
-        btnMode = tombol("Bahasa: " + namaMode[mode], 0xFFFFC857, v -> {
-            mode = (mode + 1) % 3;
-            btnMode.setText("Bahasa: " + namaMode[mode]);
-        });
-        kiri.addView(btnMode);
+        ScrollView sv = new ScrollView(this);
+        sv.setBackgroundColor(BG);
+        sv.setFillViewport(true);
+        sv.addView(kiri);
+        setContentView(sv);
+    }
 
-        etKode = new EditText(this);
-        etKode.setHint("Tulis kode di sini...");
-        etKode.setHintTextColor(0xFF7A7488);
-        etKode.setTextColor(Color.WHITE);
-        etKode.setTypeface(Typeface.MONOSPACE);
-        etKode.setTextSize(14 * f);
-        etKode.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
-                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        etKode.setGravity(Gravity.TOP | Gravity.START);
-        etKode.setMinLines(tv ? 6 : 8);
-        etKode.setBackground(kotak(0xFF241F2E, 14));
-        etKode.setPadding(dp(14), dp(12), dp(14), dp(12));
-        etKode.setText("print(\"Halo dari Termux!\")");
-        LinearLayout.LayoutParams pk = new LinearLayout.LayoutParams(-1, -2);
-        pk.topMargin = dp(12);
-        etKode.setLayoutParams(pk);
-        kiri.addView(etKode);
-
-        kiri.addView(tombol("Jalankan", 0xFF3DDC97, v -> jalankan()));
-
-        LinearLayout baris = new LinearLayout(this);
-        baris.setOrientation(LinearLayout.HORIZONTAL);
-        Button stop = tombol("Stop", 0xFFFF6B8A, v -> {
-            if (kanal != null) {
-                final ChannelExec k = kanal;
-                new Thread(() -> { try { k.disconnect(); } catch (Exception ignored) {} }).start();
-                tulis("\n[dihentikan]\n");
+    void sambung() {
+        final String host = etHost.getText().toString().trim();
+        final String user = etUser.getText().toString().trim();
+        final String pass = etPass.getText().toString();
+        int pt = 8022;
+        try { pt = Integer.parseInt(etPort.getText().toString().trim()); } catch (Exception ignored) {}
+        final int port = pt;
+        if (host.isEmpty() || user.isEmpty()) {
+            Toast.makeText(this, "Isi IP dan username dulu", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        getSharedPreferences("p", 0).edit()
+                .putString("h", host).putString("p", String.valueOf(port)).putString("u", user).apply();
+        setStatus("Menyambung ke " + host + "...", 0xFFFFC857);
+        new Thread(() -> {
+            try {
+                JSch j = new JSch();
+                Session s = j.getSession(user, host, port);
+                s.setPassword(pass);
+                s.setConfig("StrictHostKeyChecking", "no");
+                s.setServerAliveInterval(15000);
+                s.connect(8000);
+                sesi = s;
+                ui.post(this::tampilTerminal);
+            } catch (Exception e) {
+                ui.post(() -> setStatus("Gagal: " + e.getMessage(), 0xFFFF6B8A));
             }
-        });
-        Button bersih = tombol("Bersihkan", 0xFF8A8499, v -> {
-            buf.setLength(0);
-            out.setText("");
-        });
-        LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(0, dp(52), 1f);
-        p1.topMargin = dp(10);
-        p1.rightMargin = dp(5);
-        LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, dp(52), 1f);
-        p2.topMargin = dp(10);
-        p2.leftMargin = dp(5);
-        stop.setLayoutParams(p1);
-        bersih.setLayoutParams(p2);
-        baris.addView(stop);
-        baris.addView(bersih);
-        kiri.addView(baris);
+        }).start();
+    }
 
-        out = new TextView(this);
-        out.setTextColor(0xFF7CF29A);
-        out.setTypeface(Typeface.MONOSPACE);
-        out.setTextSize(13 * f);
-        out.setPadding(dp(14), dp(12), dp(14), dp(12));
-        out.setText("Output muncul di sini.");
-        outScroll = new ScrollView(this);
-        outScroll.addView(out);
-        outScroll.setBackground(kotak(0xFF0B0A10, 14));
-        outScroll.setFocusable(true);
+    // ---------- layar terminal ----------
+    void tampilTerminal() {
+        diTerminal = true;
+        memulai = false;
+        shell = null;
+        shOut = null;
 
-        if (tv) {
-            LinearLayout root = new LinearLayout(this);
-            root.setOrientation(LinearLayout.HORIZONTAL);
-            root.setBackgroundColor(BG);
-            ScrollView ks = new ScrollView(this);
-            ks.setFillViewport(true);
-            ks.addView(kiri);
-            root.addView(ks, new LinearLayout.LayoutParams(0, -1, 1f));
-            LinearLayout.LayoutParams po = new LinearLayout.LayoutParams(0, -1, 1f);
-            po.setMargins(dp(8), dp(24), dp(24), dp(24));
-            root.addView(outScroll, po);
-            setContentView(root);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(BG);
+
+        tvw = new TermView(this, px());
+        tvw.ujung = new TermView.Ujung() {
+            @Override public void kirim(byte[] b) { tulis(b); }
+            @Override public void ukuran(int c, int r) { onUkuran(c, r); }
+        };
+        tvw.ctrlDipakai = this::perbaruiCtrl;
+        root.addView(tvw, new LinearLayout.LayoutParams(-1, 0, 1f));
+        root.addView(barisTombol(), new LinearLayout.LayoutParams(-1, -2));
+        setContentView(root);
+        tvw.requestFocus();
+        tvw.postDelayed(() -> {
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null && tvw != null) imm.showSoftInput(tvw, 0);
+        }, 350);
+    }
+
+    void onUkuran(int c, int r) {
+        lastC = c;
+        lastR = r;
+        if (shell == null) {
+            if (!memulai) {
+                memulai = true;
+                mulaiShell(c, r);
+            }
         } else {
-            outScroll.setOnTouchListener((v, e) -> {
-                v.getParent().requestDisallowInterceptTouchEvent(true);
-                return false;
-            });
-            LinearLayout dalam = new LinearLayout(this);
-            dalam.setOrientation(LinearLayout.VERTICAL);
-            dalam.addView(kiri);
-            LinearLayout.LayoutParams po = new LinearLayout.LayoutParams(-1, dp(300));
-            po.setMargins(dp(20), 0, dp(20), dp(24));
-            dalam.addView(outScroll, po);
-            ScrollView sv = new ScrollView(this);
-            sv.setBackgroundColor(BG);
-            sv.setFillViewport(true);
-            sv.addView(dalam);
-            setContentView(sv);
+            final ChannelShell s = shell;
+            new Thread(() -> { try { s.setPtySize(c, r, 0, 0); } catch (Exception ignored) {} }).start();
         }
     }
 
-    @Override protected void onDestroy() {
+    void mulaiShell(final int c, final int r) {
+        final TermView t = tvw;
         final Session s = sesi;
-        new Thread(() -> { try { if (s != null) s.disconnect(); } catch (Exception ignored) {} }).start();
+        new Thread(() -> {
+            try {
+                ChannelShell ch = (ChannelShell) s.openChannel("shell");
+                ch.setPtyType("xterm", c, r, 0, 0);
+                InputStream in = ch.getInputStream();
+                OutputStream os = ch.getOutputStream();
+                ch.connect(8000);
+                shOut = os;
+                shell = ch;
+                if (lastC != c || lastR != r) ch.setPtySize(lastC, lastR, 0, 0);
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) >= 0) t.feed(buf, 0, n);
+            } catch (Exception e) {
+                t.feedText("\r\n[error: " + e.getMessage() + "]\r\n");
+            }
+            t.feedText("\r\n[sesi ditutup. Tekan Back untuk kembali]\r\n");
+        }).start();
+    }
+
+    void tulis(final byte[] b) {
+        tulisan.execute(() -> {
+            try {
+                OutputStream o = shOut;
+                if (o != null) {
+                    o.write(b);
+                    o.flush();
+                }
+            } catch (Exception ignored) {}
+        });
+    }
+
+    void perbaruiCtrl() {
+        if (btnCtrl == null || tvw == null) return;
+        btnCtrl.setBackground(kotak(tvw.ctrl ? 0xFFFFC857 : 0xFF3A3547, 10));
+        btnCtrl.setTextColor(tvw.ctrl ? 0xFF1A1620 : Color.WHITE);
+    }
+
+    Button tambah(LinearLayout row, String t, View.OnClickListener o) {
+        Button b = new Button(this);
+        b.setText(t);
+        b.setAllCaps(false);
+        b.setTextColor(Color.WHITE);
+        b.setTextSize(14 * f);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setPadding(dp(14), 0, dp(14), 0);
+        b.setBackground(kotak(0xFF3A3547, 10));
+        b.setOnClickListener(o);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-2, dp(42));
+        p.setMargins(dp(3), dp(6), dp(3), dp(6));
+        b.setLayoutParams(p);
+        row.addView(b);
+        return b;
+    }
+
+    HorizontalScrollView barisTombol() {
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        hs.setBackgroundColor(0xFF1E1A27);
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(dp(4), 0, dp(4), 0);
+        hs.addView(row);
+
+        tambah(row, "Esc", v -> tvw.kunciByte(27));
+        tambah(row, "Tab", v -> tvw.kunciByte(9));
+        btnCtrl = tambah(row, "Ctrl", v -> { tvw.ctrl = !tvw.ctrl; perbaruiCtrl(); });
+        tambah(row, "^C", v -> tvw.kunciByte(3));
+        tambah(row, "←", v -> tvw.panah('D'));
+        tambah(row, "↑", v -> tvw.panah('A'));
+        tambah(row, "↓", v -> tvw.panah('B'));
+        tambah(row, "→", v -> tvw.panah('C'));
+        tambah(row, "Home", v -> tvw.panah('H'));
+        tambah(row, "End", v -> tvw.panah('F'));
+        tambah(row, "PgUp", v -> tvw.kunci("\u001B[5~"));
+        tambah(row, "PgDn", v -> tvw.kunci("\u001B[6~"));
+        tambah(row, "|", v -> tvw.kunci("|"));
+        tambah(row, "~", v -> tvw.kunci("~"));
+        tambah(row, "/", v -> tvw.kunci("/"));
+        tambah(row, "-", v -> tvw.kunci("-"));
+        tambah(row, "Tempel", v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            ClipData d = cm == null ? null : cm.getPrimaryClip();
+            if (d != null && d.getItemCount() > 0) {
+                CharSequence t = d.getItemAt(0).coerceToText(this);
+                tvw.kunci(t.toString().replace('\n', '\r'));
+            }
+        });
+        tambah(row, "A−", v -> { fontSp = Math.max(8, fontSp - 1); tvw.setTextSizePx(px()); });
+        tambah(row, "A+", v -> { fontSp = Math.min(30, fontSp + 1); tvw.setTextSizePx(px()); });
+        return hs;
+    }
+
+    void tutupSesi() {
+        final Session s = sesi;
+        final ChannelShell c = shell;
+        sesi = null;
+        shell = null;
+        shOut = null;
+        memulai = false;
+        diTerminal = false;
+        new Thread(() -> {
+            try { if (c != null) c.disconnect(); } catch (Exception ignored) {}
+            try { if (s != null) s.disconnect(); } catch (Exception ignored) {}
+        }).start();
+    }
+
+    @Override public void onBackPressed() {
+        if (diTerminal) {
+            tutupSesi();
+            tampilLogin();
+        } else super.onBackPressed();
+    }
+
+    @Override protected void onDestroy() {
+        tutupSesi();
+        tulisan.shutdown();
         super.onDestroy();
     }
 }
